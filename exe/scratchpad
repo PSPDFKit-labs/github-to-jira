@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "sin"
+require "active_support/core_ext/object/blank"
+
+text = <<~TEXT
+Some text.
+[Some text with a link](https://foo.com)
+Just a link https://bar.com
+Just a link followed by a dot https://baz.com/.
+TEXT
+
+puts Sin::AutoLink.auto_link_urls(text)

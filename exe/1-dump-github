@@ -1,0 +1,76 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+##
+# Dump GitHub issues & comments.
+#
+# - GitHub issues -> data/issues/%d.json
+# - GitHub issue comments -> data/comments/%d.json
+#
+# It is better to dump them and iterate over dumps because of the GitHub API
+# throttling (5k requests per hour).
+
+require "sin"
+
+puts "Fetching GitHub issues ..."
+
+# Allowed `state:` values are:
+#
+# - `:open` - just open GitHub issues
+# - `:closed` - just closed GitHub issues
+# - `:all` - both open & closed GitHub issues
+#
+# If you made a dump of `:open` issues for example and you'd like
+# to proceed with `:closed` ones, backup and delete the following
+# folders before you start:
+#
+# - `data/issues`
+# - `data/comments`
+# - `data/logs`
+#
+# Keep `data/github-to-atlassian.csv` around to be able to map users.
+issues = Sin::Github.instance.issues(state: :open).reject { |x| x.key?(:pull_request) }
+puts "- fetched #{issues.size} GitHub issues"
+
+unless File.directory?("data/issues")
+  FileUtils.mkdir_p("data/issues")
+end
+
+puts "- saving issues to data/issues"
+issues.each do |issue|
+  data = JSON.pretty_generate(issue.to_h)
+  file = format("data/issues/%d.json", issue[:number])
+  File.write(file, data)
+end
+
+# Reread from the cache, to be sure we operate on the same data, we
+# don't need to bother about :number vs "number", etc. Yeah, there are
+# other ways, but it is a quick hack, nothing re-usable.
+issues = Dir.glob("data/issues/*.json").map do |file|
+  JSON.parse(File.read(file))
+end
+
+puts "- (re)read #{issues.size} GitHub issues from the cache"
+
+puts "- fetching comments"
+
+unless File.directory?("data/comments")
+  FileUtils.mkdir_p("data/comments")
+end
+
+issues.each.with_index do |issue, idx|
+  number = issue["number"]
+  puts "(#{idx + 1} / #{issues.size}) Fetching GitHub issue #{number} comments..."
+
+  comments = loop do
+    break Sin::Github.instance.comments(number)
+    rescue Octokit::TooManyRequests
+      resets_in = Sin::Github.instance.rate_limit.resets_in + 5
+      resets_at = Sin::Github.instance.rate_limit.resets_at
+      puts "- throttled, sleeping for #{resets_in} seconds (#{resets_at})"
+      sleep(resets_in)
+  end
+
+  comments = comments.map(&:to_h)
+  File.write(format("data/comments/%d.json", number), JSON.pretty_generate(comments))
+end

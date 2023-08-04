@@ -1,0 +1,36 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "sin"
+
+Dir.glob("data/logs/*.json").each do |file|
+  j = JSON.parse(File.read(file))
+
+  errors = []
+
+  github_url = j.dig("issue", "github", "url")
+
+  status = j.dig("issue", "status", "body")
+  if status["status"] != "ok"
+    errors << " - body failed #{github_url}"
+    errors << "   #{status["description"]}"
+  end
+
+  comments = j.dig("issue", "status", "comments")
+  if comments.is_a?(Array)
+    comments.each do |comment|
+      next if comment["status"] == "ok"
+
+      ghcid = comment["github_comment_id"]
+      errors << " - comment failed #{github_url}#issuecomment-#{ghcid}"
+      errors << "   #{comment["description"]}"
+    end
+  end
+
+  next if errors.size.zero?
+
+  number = j.dig("issue", "github", "number")
+  puts "Issue #{number} failed..."
+  puts " - #{j.dig("issue", "jira", "url")}"
+  puts errors.join("\n")
+end

@@ -1,0 +1,233 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "sin"
+require "active_support/core_ext/object/blank"
+require "parallel"
+
+# Set to true if you'd like to process issues in parallel. Scroll
+# down and set the number of processes. > 2 hits rate limitting,
+# but it's better than 1.
+PARALLELIZE = false
+
+# Set to `false` if you'd like to re-process all issues. Otherwise
+# only those that were not processed, or those where we failed,
+# will be processed.
+SKIP_PROCESSED = true
+
+# true if the issue was processed (= log file exists)
+def processed?(number)
+  File.exist?(format("data/logs/%d.json", number))
+end
+
+# true if the processing failed (either main body or body of any
+# comment)
+def processing_failed?(number)
+  j = JSON.parse(File.read(format("data/logs/%d.json", number)))
+
+  return true if j.dig("issue", "status", "body", "status") != "ok"
+
+  comments = j.dig("issue", "status", "comments")
+
+  if comments.is_a?(Array)
+    # Array of { "status": "ok", ... }
+    comments.any? do |comment|
+      comment["status"] != "ok"
+    end
+  else
+    # Hash with { "status": "ok", ... }
+    comments["status"] != "ok"
+  end
+end
+
+def process_issue(issues_size, issue, idx)
+  project_key = ENV.fetch("JIRA_PROJECT_KEY")
+
+  number = issue["number"]
+  key = "#{project_key}-#{number}"
+
+
+  if SKIP_PROCESSED && processed?(number) && !processing_failed?(number)
+    return
+  end
+
+  puts "(#{idx + 1} / #{issues_size}) Updating issue #{number}..."
+
+  ##
+  # Body
+
+  gh_body = issue["body"]
+  body_status = if gh_body.blank?
+                  puts "- skipping body, blank"
+                  {
+                    status: :ok,
+                    description: "Blank GitHub issue body",
+                  }
+                else
+                  doc = Sin::Body.new(issue["body"]).to_jira
+
+                  if doc.blank?
+                    puts "- failed, unable to create ADF from the GitHub issue body"
+                    {
+                      status: :failed,
+                      description: "GitHub issue body exists, but ADF is blank"
+                    }
+                  else
+                    begin
+                      body = {
+                        update: {
+                          description: [
+                            {
+                              set: doc
+                            }
+                          ]
+                        }
+                      }
+                      Sin::Jira.instance.update_issue(key, body)
+                      puts "- body updated"
+                      {
+                        status: :ok,
+                        description: "JIRA issue body updated"
+                      }
+                    rescue JIRA::HTTPError => e
+                      puts "- body update failed with #{e.code}"
+                      {
+                        status: :failed,
+                        description: "Failed to update JIRA issue body",
+                        error: {
+                          code: e.code,
+                          message: e.message
+                        }
+                      }
+                    end
+                  end
+                end
+
+  unless body_status.dig("error", "code") == 404
+    # Try to update comments only if the JIRA issue exists
+
+    # Hash[comment_id] = comment
+    comments = JSON.parse(File.read(format("data/comments/%d.json", number)))
+                 .map { |x| [x["id"], x] }
+                 .to_h
+
+    comment_statuses = if comments.blank?
+                         puts "- no comments, skipping"
+                         {
+                           status: :ok,
+                           description: "No GitHub issue comments, skipping"
+                         }
+                       else
+                         j_issue = Sin::Jira.instance.issue(key)
+                         j_comments = j_issue.comments
+
+                         processed_gh_comment_ids = Set.new
+
+                         j_issue.comments.map do |j_comment|
+                           j_comment_id = j_comment.id
+
+                           content = j_comment.body&.to_s || ""
+                           if /GHCID:(\d+)/ =~ content
+                             gh_comment_id = ::Regexp.last_match(1).to_i
+                             gh_comment = comments[gh_comment_id]
+                             base = {
+                               jira_comment_id: j_comment_id,
+                               github_comment_id: gh_comment_id
+                             }
+
+                             if processed_gh_comment_ids.include?(gh_comment_id)
+                               status = if j_comment.delete
+                                          {status: :ok, description: "Duplicate, deleted"}
+                                        else
+                                          {status: :failed, description: "Failed to delete duplicate comment"}
+                                        end
+                               next base.merge(status)
+                             end
+                             processed_gh_comment_ids.add(gh_comment_id)
+
+                             if gh_comment
+                               if gh_comment["body"].blank?
+                                 puts "- GH comment blank, skipping"
+                                 base.merge({status: :ok, description: "Skipping, blank GitHub comment" })
+                               else
+                                 doc = Sin::Body.new(gh_comment["body"]).to_jira(ghcid: gh_comment_id)
+
+                                 if doc.blank?
+                                   puts "- Can't convert comment body to ADF"
+                                   base.merge({status: :failed, description: "Can't convert body to ADF"})
+                                 else
+                                   begin
+                                     body = {
+                                       body: doc
+                                     }
+                                     j_comment.save!(body)
+                                     puts "- comment updated"
+                                     base.merge({status: :ok, description: "Comment updated"})
+                                   rescue JIRA::HTTPError => e
+                                     puts "- failed to update comment #{e.code}: #{e.message}"
+                                     base.merge({status: :failed,
+                                                 description: "Failed to update JIRA comment",
+                                                 error: { code: e.code, message: e.message }})
+                                   end
+                                 end
+                               end
+                             else
+                               puts "- failed, can't find GH comment #{gh_comment_id}"
+                               base.merge({status: :failed, description: "Can't find GitHub comment"})
+                             end
+                           else
+                             puts "- failed, no GHCID in comment"
+                             {
+                               status: :failed,
+                               description: "Failed to detect the GitHub comment ID",
+                               jira_comment_id: j_comment_id
+                             }
+                           end
+                         end
+                       end
+  end
+
+  log = {
+    issue: {
+      github: {
+        number: number,
+        url: issue["html_url"]
+      },
+      jira: {
+        key: key,
+        url: "https://#{ENV.fetch("JIRA_HOST")}/browse/#{key}"
+      },
+      status: {
+        body: body_status,
+        comments: comment_statuses
+      }
+    }
+  }
+
+  File.write(format("data/logs/%d.json", number), JSON.pretty_generate(log))
+end
+
+
+puts "Reading issues..."
+issues = Dir.glob("data/issues/*.json").map do |file|
+  JSON.parse(File.read(file))
+end
+puts "- read #{issues.size} issues"
+
+unless File.directory?("data/logs")
+  FileUtils.mkdir_p("data/logs")
+end
+
+issues_size = issues.size
+
+if PARALLELIZE
+  # Keep the number relatively low otherwise you'll get too many
+  # requests
+  Parallel.each_with_index(issues, in_processes: 2) do |issue, idx|
+    process_issue(issues_size, issue, idx)
+  end
+else
+  issues.each_with_index do |issue, idx|
+    process_issue(issues_size, issue, idx)
+  end
+end

@@ -1,0 +1,32 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+##
+# Generate JSON for JIRA import.
+# https://support.atlassian.com/jira-cloud-administration/docs/import-data-from-json/
+#
+# It generates everything, except bodies for issues & comments. We're going
+# to update them via API later to be able to use Atlassian Document
+# Format (= to make it nice).
+
+require "sin"
+
+puts "Generating JSON for Jira..."
+issues = Dir.glob("data/issues/*.json").map do |file|
+  issue = JSON.parse(File.read(file))
+  comments = JSON.parse(File.read(format("data/comments/%d.json", issue["number"])))
+  Sin::Generator.new(ENV.fetch("JIRA_PROJECT_KEY"), issue, comments).to_jira
+end
+
+for_import = {
+  projects: [
+    {
+      key: ENV.fetch("JIRA_PROJECT_KEY"),
+      issues: issues
+    }
+  ]
+}
+
+File.write("data/jira-import-me.json", JSON.pretty_generate(for_import))
+puts "- done, written to data/jira-import-me.json"
+puts "- import at https://#{ENV.fetch("JIRA_HOST")}/secure/admin/ExternalImport1.jspa"
